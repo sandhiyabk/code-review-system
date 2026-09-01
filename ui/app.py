@@ -1,4 +1,19 @@
 # ui/app.py
+"""
+Self-contained Streamlit UI for the AI Code Review Assistant.
+
+This version runs the review pipeline DIRECTLY (imports core.pipeline)
+and does NOT depend on a separately-running FastAPI backend. This makes
+it deployable as a standalone Streamlit app (Streamlit Cloud / HuggingFace
+Space) without needing a second service.
+
+It also optionally integrates the two new additive components:
+  - GitHub file input (ui.components.github_input)
+  - RAGAS review-quality evaluation (ui.components.evaluation_display)
+
+All optional integrations degrade gracefully if their dependencies
+(RAGAS, etc.) are unavailable. The core review always works.
+"""
 
 import sys
 import os
@@ -7,14 +22,37 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
-import requests
-import json
+
+# ─── Core pipeline (direct import — no HTTP backend needed) ───
+from core.pipeline import review_code
+from core.chroma_store import StyleRuleStore
+
+# ─── Optional additive components (never required) ────────────
+HAS_GITHUB_UI = False
+HAS_EVAL_UI = False
+try:
+    from ui.components.github_input import render_github_input
+    HAS_GITHUB_UI = True
+except ImportError:
+    pass
+try:
+    from ui.components.evaluation_display import render_evaluation
+    HAS_EVAL_UI = True
+except ImportError:
+    pass
 
 st.set_page_config(
     page_title="AI Code Review Assistant",
     page_icon="🔍",
     layout="wide"
 )
+
+# Cache the ChromaDB store so it's only initialized once per session
+@st.cache_resource
+def get_store():
+    """Return a reusable ChromaDB style-rule store."""
+    return StyleRuleStore()
+
 
 # ─── Header ───────────────────────────────────────────
 st.title("🔍 AI Code Review Assistant")
@@ -28,9 +66,15 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("📝 Your Code")
 
+    # ── Optional GitHub input (additive) ──
+    # Provides a "Paste code | GitHub URL" toggle. If the fetched
+    # code is ready for review, it takes priority over the text box.
+    if HAS_GITHUB_UI:
+        gh_source = render_github_input()
+
     code = st.text_area(
         "Paste Python code here",
-        height=320,
+        height=300,
         placeholder="""def find_user(users, id):
     for i in range(len(users)):
         for j in range(len(users)):
@@ -39,35 +83,34 @@ with col1:
         label_visibility="collapsed"
     )
 
-    col_btn1, col_btn2 = st.columns([2, 1])
+    # If a GitHub file was successfully fetched and the user clicked
+    # "Review This Code", use that content instead of the paste box.
+    if HAS_GITHUB_UI and gh_source.get("fetch_success"):
+        if gh_source.get("review_clicked"):
+            code = gh_source["code"]
 
-    with col_btn1:
-        review_btn = st.button(
-            "🔍 Review Code",
-            type="primary",
-            use_container_width=True
-        )
+    # ── Compact status note (self-contained mode) ──
+    st.caption("🟢 Running as standalone app (no backend service required)")
 
-    with col_btn2:
-        clear_btn = st.button(
-            "Clear",
-            use_container_width=True
-        )
+col_btn1, col_btn2 = st.columns([2, 1])
 
-    if clear_btn:
-        st.rerun()
+with col_btn1:
+    review_btn = st.button(
+        "🔍 Review Code",
+        type="primary",
+        use_container_width=True
+    )
 
-    # API status check
-    try:
-        health = requests.get("http://localhost:8000/health", timeout=2)
-        if health.status_code == 200:
-            st.success("✅ API Connected")
-        else:
-            st.error("❌ API Error")
-    except:
-        st.warning("⚠️ FastAPI not running — start it first")
-        st.code("uvicorn api.main:app --reload", language="bash")
+with col_btn2:
+    clear_btn = st.button(
+        "Clear",
+        use_container_width=True
+    )
 
+if clear_btn:
+    st.rerun()
+
+# ─── Review Results ──────────────────────────────────
 with col2:
     st.subheader("📊 Review Results")
 
@@ -77,25 +120,18 @@ with col2:
         else:
             with st.spinner("🔄 Analyzing code..."):
                 try:
-                    response = requests.post(
-                        "http://localhost:8000/review",
-                        json={"code": code, "language": "python"},
-                        timeout=30
-                    )
+                    # Run the pipeline DIRECTLY — no HTTP backend dependency
+                    result = review_code(code)
+                    st.session_state.result = result
 
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.session_state.result = result
-                    else:
-                        st.error(f"API Error: {response.json().get('detail', 'Unknown error')}")
-
-                except requests.exceptions.ConnectionError:
-                    st.error("Cannot connect to API")
-                    st.info("Run this in a separate terminal first:")
-                    st.code("uvicorn api.main:app --reload", language="bash")
-
-                except requests.exceptions.Timeout:
-                    st.error("Request timed out — LLM taking too long")
+                    # Store the retrieved rules so the evaluation
+                    # component can score them (additive).
+                    try:
+                        store = get_store()
+                        st.session_state.retrieved_rules = \
+                            store.get_relevant_rules(code)
+                    except Exception:
+                        st.session_state.retrieved_rules = []
 
                 except Exception as e:
                     st.error(f"Unexpected error: {str(e)}")
@@ -165,6 +201,14 @@ with col2:
             # Copy button hint
             st.caption("👆 Click top-right corner of code block to copy")
 
+        # ── Optional RAGAS evaluation (additive, runs async) ──
+        if HAS_EVAL_UI:
+            render_evaluation(
+                code_input=code,
+                generated_review=result,
+                retrieved_rules=st.session_state.get("retrieved_rules", []),
+            )
+
     else:
         # Placeholder when no result yet
         st.info("👈 Paste your code and click Review to get started")
@@ -178,7 +222,7 @@ with col2:
 
         **Powered by:**
         - RAG Pipeline (ChromaDB)
-        - Llama3.3 via Groq API
+        - Groq API (GPT-OSS-20B)
         - Python AST validation
         """)
 

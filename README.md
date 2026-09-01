@@ -3,10 +3,10 @@ title: AI Code Review Assistant
 emoji: 🏃
 colorFrom: pink
 colorTo: indigo
-sdk: gradio
-sdk_version: 6.17.3
+sdk: streamlit
+sdk_version: 1.58.0
 python_version: '3.13'
-app_file: app.py
+app_file: ui/app.py
 pinned: false
 short_description: Building trustworthy AI code reviews by combining static ana
 ---
