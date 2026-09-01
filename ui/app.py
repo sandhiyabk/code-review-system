@@ -61,7 +61,7 @@ with col1:
     try:
         health = requests.get("http://localhost:8000/health", timeout=2)
         if health.status_code == 200:
-            st.success("✅ API Connected", icon="✅")
+            st.success("✅ API Connected")
         else:
             st.error("❌ API Error")
     except:

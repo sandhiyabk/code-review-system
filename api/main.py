@@ -42,7 +42,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-20b",
         "vector_db": "chromadb",
         "rag": "active"
     }

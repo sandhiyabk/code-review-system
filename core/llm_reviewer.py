@@ -18,7 +18,7 @@ def get_llm_review(prompt: str) -> dict:
     """
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=[
                 {
                     "role": "system",
@@ -47,7 +47,7 @@ Required format:
                 }
             ],
             temperature=0.1,
-            max_tokens=1500,
+            max_tokens=3000,
         )
 
         raw = response.choices[0].message.content
