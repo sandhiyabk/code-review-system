@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from core.pipeline import review_code
+from core.llm_client import get_llm_client
 import uvicorn
 
 app = FastAPI(
@@ -40,9 +41,20 @@ async def root():
 
 @app.get("/health")
 async def health():
+    # Report which LLM backend is actually active so the health endpoint
+    # reflects real configuration (Groq cloud vs local Ollama, etc.).
+    try:
+        info = get_llm_client().get_backend_info()
+        model = info["model"]
+        backend = info["backend"]
+    except Exception:
+        # Never fail the health check because of backend probing
+        model = "unknown"
+        backend = "unknown"
     return {
         "status": "healthy",
-        "model": "openai/gpt-oss-20b",
+        "model": model,
+        "backend": backend,
         "vector_db": "chromadb",
         "rag": "active"
     }
@@ -68,9 +80,20 @@ async def review(input: CodeInput):
         result = review_code(input.code)
         return result
     except Exception as e:
+        # Convert backend errors into a helpful message instead of a raw
+        # traceback string. The pipeline already returns user-friendly
+        # dicts for LLM failures, so this only catches truly unexpected
+        # errors — and we still keep the detail readable.
+        from core.llm_reviewer import get_error_suggestions
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail=(
+                f"Code review failed: {str(e)[:300]}. "
+                "If you are running a local LLM (Ollama, LM Studio, "
+                "LocalAI), set LLM_BACKEND=ollama and ensure it is "
+                "running. Suggestions: "
+                + "; ".join(get_error_suggestions(str(e))[:2])
+            )
         )
 
 # ─── Run ──────────────────────────────────────────────

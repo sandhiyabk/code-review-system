@@ -43,9 +43,16 @@ def review_code(code: str) -> dict:
     print("Step 3: Building enriched prompt...")
     prompt = build_prompt(code, ast_data, relevant_rules)
 
-    # Layer 4: LLM Review
-    print("Step 4: Sending to Groq LLM for review...")
+    # Layer 4: LLM Review (backend-agnostic — Groq or local Ollama)
+    print("Step 4: Sending to LLM for review...")
     raw_review = get_llm_review(prompt)
+
+    # If the LLM call itself failed, get_llm_review returns a review-shaped
+    # dict with a user-friendly error + suggestions. Cross-validating that
+    # against AST is meaningless and would overwrite the score, so return
+    # the error result as-is (additive guard, doesn't affect success path).
+    if raw_review.get("llm_error"):
+        return raw_review
 
     # Layer 5: Validate
     print("Step 5: Validating against AST data...")

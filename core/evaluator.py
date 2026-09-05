@@ -83,11 +83,12 @@ class CodeReviewEvaluator:
         """
         Initialize the evaluator by setting up the RAGAS LLM client.
 
-        Reuses the existing Groq API key from the project's .env file.
-        The evaluation LLM is the same model used for code review
-        (openai/gpt-oss-20b) to keep costs consistent.
+        Uses the same unified LLM backend as the review pipeline
+        (Groq by default, or a local/OpenAI-compatible endpoint if
+        configured via LLM_BACKEND). This keeps evaluation consistent
+        with the backend that produced the review.
 
-        If Groq client creation fails, all evaluations will return
+        If LLM client initialization fails, all evaluations will return
         the graceful fallback result.
         """
         self._ragas_llm = None
@@ -101,24 +102,54 @@ class CodeReviewEvaluator:
         try:
             start = time.time()
 
-            # Import Groq client — same one used in llm_reviewer.py
-            # This reuses the existing GROQ_API_KEY env var
-            from groq import Groq
-            groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            # Reuse the unified LLM client so evaluation follows whichever
+            # backend the user configured (Groq by default, or a local LLM).
+            # This keeps the evaluator consistent with the review pipeline.
+            from core.llm_client import get_llm_client
+            llm = get_llm_client()
 
-            # Create RAGAS LLM instance using Groq provider
-            # RAGAS uses instructor adapter for Groq (auto-detected)
-            self._ragas_llm = llm_factory(
-                "openai/gpt-oss-20b",
-                provider="groq",
-                client=groq_client
-            )
+            if llm.backend == "none" or llm.client is None:
+                # No backend configured — evaluation will use the fallback
+                print("[evaluator] No LLM backend configured — "
+                      "evaluation disabled")
+                self._ragas_llm = None
+                return
+
+            if llm.backend == "groq":
+                # Preserve the existing Groq path exactly: RAGAS uses its
+                # Groq provider/Instructor adapter with the model already
+                # deployed. Reusing the client from llm_client() avoids
+                # creating a second connection.
+                from groq import Groq
+                if not isinstance(llm.client, Groq):
+                    # Defensive: recreate only if the shared client isn't a
+                    # Groq instance (shouldn't happen, but never hard-crash).
+                    groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+                else:
+                    groq_client = llm.client
+                self._ragas_llm = llm_factory(
+                    llm.default_model,
+                    provider="groq",
+                    client=groq_client,
+                )
+            else:
+                # Local/OpenAI-compatible backends (Ollama, LM Studio, LocalAI)
+                # speak the OpenAI protocol, so use RAGAS's OpenAI provider
+                # pointed at the same base_url + model as the main client.
+                provider = "openai"
+                self._ragas_llm = llm_factory(
+                    llm.default_model,
+                    provider=provider,
+                    client=llm.client,
+                )
 
             self._init_time_ms = round((time.time() - start) * 1000)
-            print(f"[evaluator] Initialized in {self._init_time_ms}ms")
+            print(f"[evaluator] Initialized in {self._init_time_ms}ms "
+                  f"(backend={llm.backend})")
 
         except Exception as e:
             # If initialization fails, evaluation will use fallback
+            # (never blocks the main review and never shows a traceback)
             print(f"[evaluator] Failed to initialize: {e}")
             self._ragas_llm = None
 

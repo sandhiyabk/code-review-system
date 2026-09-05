@@ -26,6 +26,7 @@ import streamlit as st
 # ─── Core pipeline (direct import — no HTTP backend needed) ───
 from core.pipeline import review_code
 from core.chroma_store import StyleRuleStore
+from core.llm_client import get_llm_client
 
 # ─── Optional additive components (never required) ────────────
 HAS_GITHUB_UI = False
@@ -46,6 +47,42 @@ st.set_page_config(
     page_icon="🔍",
     layout="wide"
 )
+
+
+def render_llm_status():
+    """
+    Show which LLM backend is active in the sidebar.
+
+    Helps users understand whether the cloud Groq backend or a local
+    LLM (Ollama) is being used, and surfaces a conflict-free setup
+    message if no backend is configured.
+    """
+    try:
+        client = get_llm_client()
+        info = client.get_backend_info()
+
+        if info["backend"] == "none":
+            st.sidebar.error(
+                "No LLM configured\n\n"
+                "Set GROQ_API_KEY for cloud (free)\n"
+                "or install Ollama for local use"
+            )
+        elif info["is_local"]:
+            st.sidebar.success(
+                f"Local LLM: {info['model']} via Ollama"
+            )
+        else:
+            st.sidebar.success(
+                f"Cloud LLM: {info['model']}\n"
+                f"via {info['backend'].title()}"
+            )
+    except Exception:
+        # Never break the UI if the status check fails
+        pass
+
+
+# Render backend status indicator in sidebar
+render_llm_status()
 
 # Cache the ChromaDB store so it's only initialized once per session
 @st.cache_resource
@@ -222,7 +259,7 @@ with col2:
 
         **Powered by:**
         - RAG Pipeline (ChromaDB)
-        - Groq API (GPT-OSS-20B)
+        - LLM API (Groq cloud or local Ollama)
         - Python AST validation
         """)
 

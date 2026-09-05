@@ -1,4 +1,5 @@
 groq
+openai
 python-dotenv
 chromadb
 fastapi
