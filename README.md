@@ -8,7 +8,7 @@ sdk_version: 1.58.0
 python_version: '3.13'
 app_file: ui/app.py
 pinned: false
-short_description: AI code review assistant combining AST analysis, RAG, and LLM review
+short_description: AI code reviewer combining AST analysis, RAG, and LLM
 ---
 
 Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
