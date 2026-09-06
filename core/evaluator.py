@@ -1,17 +1,35 @@
 # core/evaluator.py
 """
-RAGAS Evaluation Pipeline for Code Review Quality Assessment.
+LLM-based Quality Evaluation for Code Reviews.
 
-This module evaluates the quality of AI-generated code reviews using
-RAGAS (Retrieval Augmented Generation Assessment) metrics. It measures
-whether the review is faithful to retrieved rules, relevant to the code,
-and whether retrieval was precise and comprehensive.
+This module measures the quality of an AI-generated code review (not just
+whether it ran) using the same four metrics and weights as the original
+RAGAS-style design:
+
+| Metric            | Weight | What it measures |
+|-------------------|--------|------------------|
+| Faithfulness      | 35%    | Is the review's advice grounded in the retrieved style rules? |
+| Answer Relevancy  | 30%    | Does the review address the submitted code specifically? |
+| Context Precision | 20%    | Were the retrieved rules actually relevant to the code? |
+| Context Recall    | 15%    | Were all needed rules retrieved? |
+
+RAGAS metrics are LLM-judge metrics: an LLM compares the review against
+the retrieved context and returns a score. This module performs exactly
+that comparison using the app's *own* unified LLM backend (`get_llm_client`)
+— the same one that produces the review. This means:
+
+- No extra dependencies (no `ragas`/`datasets`/embeddings required).
+- Works identically on every backend (Groq cloud, Ollama, OpenAI,
+  or any OpenAI-compatible endpoint).
+- Degrades gracefully: if no backend is configured or the LLM call fails,
+  a structured fallback is returned and the main review still works.
 
 The evaluation is designed to run ASYNC to the main review pipeline —
 the review shows first, evaluation runs after to avoid blocking the user.
 """
 
 import os
+import re
 import time
 import hashlib
 import json
@@ -20,27 +38,6 @@ from dotenv import load_dotenv
 
 # Load environment variables for API keys
 load_dotenv()
-
-# ──────────────────────────────────────────────────────────
-# Conditional RAGAS import — graceful degradation if not installed
-# ──────────────────────────────────────────────────────────
-RAGAS_AVAILABLE = False
-try:
-    from ragas import evaluate
-    from ragas.llms import llm_factory
-    from ragas.metrics import (
-        Faithfulness,
-        ContextPrecision,
-        ContextRecall,
-        AnswerCorrectness,
-    )
-    from datasets import Dataset
-    RAGAS_AVAILABLE = True
-except ImportError:
-    # RAGAS or its dependencies not installed — evaluation will
-    # gracefully return fallback results instead of crashing
-    Dataset = None
-    evaluate = None
 
 # ──────────────────────────────────────────────────────────
 # Weighted scoring configuration
@@ -64,11 +61,12 @@ _EVAL_CACHE: Dict[str, dict] = {}
 
 class CodeReviewEvaluator:
     """
-    Evaluates code review quality using RAGAS metrics.
+    Evaluates code review quality using LLM-judged metrics.
 
-    Uses the same Groq API (LLaMA 3.3-70B) already configured
-    in the project for evaluation LLM calls. RAGAS natively
-    supports Groq via its instructor adapter.
+    Uses the same unified LLM backend as the review pipeline (Groq by
+    default, or a local/OpenAI-compatible endpoint if configured via
+    LLM_BACKEND). This keeps evaluation consistent with the backend that
+    produced the review.
 
     Usage:
         evaluator = CodeReviewEvaluator()
@@ -81,30 +79,20 @@ class CodeReviewEvaluator:
 
     def __init__(self):
         """
-        Initialize the evaluator by setting up the RAGAS LLM client.
+        Initialize the evaluator against the shared LLM client.
 
-        Uses the same unified LLM backend as the review pipeline
-        (Groq by default, or a local/OpenAI-compatible endpoint if
-        configured via LLM_BACKEND). This keeps evaluation consistent
-        with the backend that produced the review.
-
-        If LLM client initialization fails, all evaluations will return
-        the graceful fallback result.
+        If no LLM backend is configured, or initialization fails, all
+        evaluations gracefully return the fallback result.
         """
-        self._ragas_llm = None
+        self._llm = None
+        self._backend = None
         self._init_time_ms = 0
-
-        if not RAGAS_AVAILABLE:
-            print("[evaluator] RAGAS library not available — "
-                  "evaluation disabled")
-            return
 
         try:
             start = time.time()
 
             # Reuse the unified LLM client so evaluation follows whichever
             # backend the user configured (Groq by default, or a local LLM).
-            # This keeps the evaluator consistent with the review pipeline.
             from core.llm_client import get_llm_client
             llm = get_llm_client()
 
@@ -112,37 +100,10 @@ class CodeReviewEvaluator:
                 # No backend configured — evaluation will use the fallback
                 print("[evaluator] No LLM backend configured — "
                       "evaluation disabled")
-                self._ragas_llm = None
                 return
 
-            if llm.backend == "groq":
-                # Preserve the existing Groq path exactly: RAGAS uses its
-                # Groq provider/Instructor adapter with the model already
-                # deployed. Reusing the client from llm_client() avoids
-                # creating a second connection.
-                from groq import Groq
-                if not isinstance(llm.client, Groq):
-                    # Defensive: recreate only if the shared client isn't a
-                    # Groq instance (shouldn't happen, but never hard-crash).
-                    groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-                else:
-                    groq_client = llm.client
-                self._ragas_llm = llm_factory(
-                    llm.default_model,
-                    provider="groq",
-                    client=groq_client,
-                )
-            else:
-                # Local/OpenAI-compatible backends (Ollama, LM Studio, LocalAI)
-                # speak the OpenAI protocol, so use RAGAS's OpenAI provider
-                # pointed at the same base_url + model as the main client.
-                provider = "openai"
-                self._ragas_llm = llm_factory(
-                    llm.default_model,
-                    provider=provider,
-                    client=llm.client,
-                )
-
+            self._llm = llm
+            self._backend = llm.backend
             self._init_time_ms = round((time.time() - start) * 1000)
             print(f"[evaluator] Initialized in {self._init_time_ms}ms "
                   f"(backend={llm.backend})")
@@ -151,7 +112,6 @@ class CodeReviewEvaluator:
             # If initialization fails, evaluation will use fallback
             # (never blocks the main review and never shows a traceback)
             print(f"[evaluator] Failed to initialize: {e}")
-            self._ragas_llm = None
 
     def _generate_cache_key(
         self,
@@ -170,82 +130,13 @@ class CodeReviewEvaluator:
         combined = code_input.strip() + "|||" + review_str
         return hashlib.sha256(combined.encode()).hexdigest()
 
-    def prepare_ragas_dataset(
-        self,
-        code_input: str,
-        generated_review: dict,
-        retrieved_rules: List[str],
-        review_question: str
-    ) -> Any:
-        """
-        Convert our internal data structures into RAGAS Dataset format.
-
-        RAGAS expects a HuggingFace Dataset with these columns:
-        - question: The original query/prompt (our review question)
-        - answer: The generated response (our code review as text)
-        - contexts: List of retrieved context chunks (our style rules)
-        - ground_truth: Expected answer (derived from rules + code)
-
-        Args:
-            code_input: The original Python code submitted for review
-            generated_review: Dict with bugs, suggestions, quality_score, etc.
-            retrieved_rules: List of style rules retrieved from ChromaDB
-            review_question: The prompt that was sent to the LLM
-
-        Returns:
-            A HuggingFace Dataset ready for RAGAS evaluation
-
-        Raises:
-            ImportError: If RAGAS/datasets libraries not available
-            ValueError: If inputs are empty or malformed
-        """
-        if not RAGAS_AVAILABLE:
-            raise ImportError(
-                "RAGAS library not installed. "
-                "Install with: pip install ragas datasets"
-            )
-
-        # Validate inputs — empty data means evaluation is meaningless
-        if not code_input or not code_input.strip():
-            raise ValueError("code_input cannot be empty")
-        if not generated_review:
-            raise ValueError("generated_review cannot be empty")
-
-        # Convert the structured review dict to a single text string.
-        # RAGAS "answer" field expects a text response, not JSON.
-        answer_text = self._review_to_text(generated_review)
-
-        # If no rules were retrieved, use a placeholder
-        # so RAGAS doesn't get an empty context list
-        contexts = retrieved_rules if retrieved_rules else [
-            "No specific style rules were retrieved for this code."
-        ]
-
-        # Build ground_truth from the retrieved rules themselves.
-        # For self-evaluation (no golden dataset), ground_truth is
-        # constructed as "what a good review based on these rules
-        # should contain" — this gives RAGAS a reference point.
-        ground_truth = self._build_ground_truth(
-            code_input, retrieved_rules
-        )
-
-        # Create the RAGAS-compatible dataset with all required columns
-        data = {
-            "question": [review_question],
-            "answer": [answer_text],
-            "contexts": [contexts],
-            "ground_truth": [ground_truth],
-        }
-
-        return Dataset.from_dict(data)
-
     def _review_to_text(self, review: dict) -> str:
         """
-        Convert structured review dict to plain text for RAGAS.
+        Convert structured review dict to plain text for the LLM judge.
 
-        RAGAS metrics compare text answers against contexts.
-        We flatten the structured review into readable paragraphs
-        so faithfulness and relevancy can be properly measured.
+        The metrics compare the review-as-text against the retrieved
+        rules and the submitted code, so we flatten the structured
+        review into readable paragraphs first.
         """
         parts = []
 
@@ -281,35 +172,91 @@ class CodeReviewEvaluator:
 
         return " | ".join(parts)
 
-    def _build_ground_truth(
+    def _parse_scores(self, raw: str) -> Optional[Dict[str, float]]:
+        """
+        Parse the LLM's JSON scoring response into clamped 0-1 scores.
+
+        Returns a dict with one key per metric in METRIC_WEIGHTS, or
+        None if the response cannot be parsed (the caller then falls
+        back to the graceful fallback result).
+        """
+        try:
+            # Clean any markdown code fences if present
+            clean = re.sub(r"```json|```", "", raw).strip()
+            data = json.loads(clean)
+
+            scores = {}
+            for key in METRIC_WEIGHTS:
+                value = float(data.get(key))
+                # Clamp to a valid 0.0-1.0 range (defensive)
+                scores[key] = max(0.0, min(1.0, value))
+            return scores
+
+        except Exception as e:
+            print(f"[evaluator] Could not parse LLM scores: {e}")
+            return None
+
+    def _ask_for_scores(
         self,
         code_input: str,
+        review_text: str,
         retrieved_rules: List[str]
-    ) -> str:
+    ) -> Optional[Dict[str, float]]:
         """
-        Construct a reference answer from retrieved rules.
+        Ask the configured LLM to rate the review on the four metrics.
 
-        Since we don't have a golden dataset of "perfect reviews",
-        we build a synthetic ground truth that represents what a
-        review SHOULD contain given the retrieved rules. This gives
-        RAGAS's Answer Correctness metric something to compare against.
+        This is a single LLM call that returns a JSON object with four
+        scores in the 0.0-1.0 range — mirroring what the RAGAS
+        LLM-judge metrics compute, without any external dependencies.
         """
-        if not retrieved_rules:
-            return (
-                "A review of this code should identify potential "
-                "issues and provide actionable suggestions based on "
-                "general Python best practices."
-            )
-
-        # Compose ground truth from the rules themselves:
-        # "A review of this code should follow these rules: ..."
-        rules_text = "; ".join(retrieved_rules)
-        return (
-            f"A review of this code should address the following "
-            f"coding standards and best practices: {rules_text}. "
-            f"The review should be specific to the provided code "
-            f"and reference concrete patterns found in it."
+        rules_text = "; ".join(retrieved_rules) if retrieved_rules else (
+            "None - no coding standards were retrieved for this code."
         )
+
+        system_prompt = (
+            "You are an expert evaluator of code-review quality. "
+            "You rate reviews on four scales, each 0.0 to 1.0. "
+            "You must respond with ONLY valid JSON and no other text."
+        )
+
+        user_prompt = (
+            "Rate the quality of the following AI-generated code review.\n\n"
+            "=== SUBMITTED CODE ===\n"
+            f"{code_input[:2000]}\n\n"
+            "=== RETRIEVED CODING STANDARDS (CONTEXT) ===\n"
+            f"{rules_text}\n\n"
+            "=== GENERATED REVIEW ===\n"
+            f"{review_text[:600]}\n\n"
+            "Rate the review on these four scales (0.0 to 1.0):\n"
+            "- faithfulness: how much of the review's advice is directly "
+            "supported by the retrieved coding standards? (treat the "
+            "standards as the only source of truth)\n"
+            "- answer_relevancy: how relevant is the review to the "
+            "submitted code specifically, rather than generic advice?\n"
+            "- context_precision: what fraction of the retrieved coding "
+            "standards are actually relevant to this code?\n"
+            "- context_recall: how well do the retrieved standards cover "
+            "the important issues in this code? Use 0.5 if no standards "
+            "were retrieved.\n\n"
+            "Respond with ONLY valid JSON in exactly this shape:\n"
+            '{"faithfulness":0.0,"answer_relevancy":0.0,'
+            '"context_precision":0.0,"context_recall":0.0}'
+        )
+
+        try:
+            raw = self._llm.complete(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=1024,
+            )
+            return self._parse_scores(raw)
+
+        except Exception as e:
+            print(f"[evaluator] Score request failed: {e}")
+            return None
 
     def evaluate_review(
         self,
@@ -318,16 +265,14 @@ class CodeReviewEvaluator:
         retrieved_rules: List[str]
     ) -> dict:
         """
-        Run all 4 RAGAS metrics and return comprehensive evaluation.
+        Run all 4 LLM-judged metrics and return comprehensive evaluation.
 
         This is the main public method. It:
         1. Checks the cache for previous evaluations
-        2. Prepares the RAGAS dataset
-        3. Runs Faithfulness, Answer Relevancy, Context Precision,
-           and Context Recall metrics
-        4. Computes weighted overall quality score
-        5. Generates human-readable interpretation
-        6. Caches the result
+        2. Asks the LLM to rate the review on the 4 metrics
+        3. Computes weighted overall quality score
+        4. Generates human-readable interpretation
+        5. Caches the result
 
         Args:
             code_input: The original Python code
@@ -346,65 +291,29 @@ class CodeReviewEvaluator:
             return _EVAL_CACHE[cache_key]
 
         # ── Pre-flight checks ──
-        if not RAGAS_AVAILABLE:
+        if self._llm is None:
             return self._fallback_result(
-                "RAGAS library not installed. "
-                "Install with: pip install ragas datasets"
-            )
-
-        if self._ragas_llm is None:
-            return self._fallback_result(
-                "Evaluation LLM not initialized. "
-                "Check GROQ_API_KEY environment variable."
+                "Evaluation LLM not initialized. Configure an LLM backend "
+                "(GROQ_API_KEY for cloud, or LLM_BACKEND=ollama for local)."
             )
 
         start_time = time.time()
 
         try:
-            # ── Build the review question (what was asked) ──
-            review_question = (
-                f"Review this Python code for bugs, complexity, "
-                f"suggestions, and provide an improved version:\n\n"
-                f"{code_input[:500]}"
-            )
+            # ── Flatten the review into text for the LLM judge ──
+            review_text = self._review_to_text(generated_review)
 
-            # ── Prepare RAGAS dataset ──
-            dataset = self.prepare_ragas_dataset(
+            # ── Ask the LLM to rate the review ──
+            scores = self._ask_for_scores(
                 code_input=code_input,
-                generated_review=generated_review,
+                review_text=review_text,
                 retrieved_rules=retrieved_rules,
-                review_question=review_question
             )
-
-            # ── Initialize metrics with the Groq-backed LLM ──
-            # Each metric needs the LLM for its internal evaluation calls
-            metrics = [
-                Faithfulness(llm=self._ragas_llm),
-                AnswerCorrectness(llm=self._ragas_llm),
-                ContextPrecision(llm=self._ragas_llm),
-                ContextRecall(llm=self._ragas_llm),
-            ]
-
-            # ── Run RAGAS evaluation ──
-            # This makes multiple LLM calls internally to score each metric
-            result = evaluate(dataset, metrics=metrics)
-
-            # ── Extract scores from RAGAS result ──
-            # RAGAS returns a result object with metric scores
-            scores = {
-                "faithfulness": self._extract_score(
-                    result, "faithfulness"
-                ),
-                "answer_relevancy": self._extract_score(
-                    result, "answer_correctness"
-                ),
-                "context_precision": self._extract_score(
-                    result, "context_precision"
-                ),
-                "context_recall": self._extract_score(
-                    result, "context_recall"
-                ),
-            }
+            if scores is None:
+                return self._fallback_result(
+                    "The evaluation LLM did not return parseable scores. "
+                    "Please try again."
+                )
 
             # ── Calculate weighted overall quality ──
             overall = sum(
@@ -444,59 +353,6 @@ class CodeReviewEvaluator:
             elapsed_ms = round((time.time() - start_time) * 1000)
             print(f"[evaluator] Evaluation failed after {elapsed_ms}ms: {e}")
             return self._fallback_result(str(e))
-
-    def _extract_score(self, result, metric_name: str) -> float:
-        """
-        Safely extract a metric score from RAGAS result object.
-
-        RAGAS result objects can vary in structure depending on version.
-        This method handles multiple possible formats and always
-        returns a float between 0.0 and 1.0.
-        """
-        try:
-            # Try accessing as dictionary first (older RAGAS versions)
-            if hasattr(result, "to_pandas"):
-                df = result.to_pandas()
-                if metric_name in df.columns:
-                    return float(df[metric_name].iloc[0])
-
-            # Try direct attribute access (newer RAGAS versions)
-            if hasattr(result, metric_name):
-                val = getattr(result, metric_name)
-                if isinstance(val, (int, float)):
-                    return float(val)
-                # If it's a list/array, take first element
-                if hasattr(val, "__len__") and len(val) > 0:
-                    return float(val[0])
-
-            # Try dictionary-style access
-            if isinstance(result, dict) and metric_name in result:
-                return float(result[metric_name])
-
-            # Try scores attribute (some RAGAS versions)
-            if hasattr(result, "scores"):
-                scores = result.scores
-                if isinstance(scores, dict) and metric_name in scores:
-                    return float(scores[metric_name])
-                if isinstance(scores, list) and len(scores) > 0:
-                    score_dict = scores[0]
-                    if isinstance(score_dict, dict):
-                        return float(
-                            score_dict.get(metric_name, 0.5)
-                        )
-
-            # If all else fails, return neutral score
-            print(
-                f"[evaluator] Could not extract '{metric_name}' "
-                f"from result — defaulting to 0.5"
-            )
-            return 0.5
-
-        except Exception as e:
-            print(
-                f"[evaluator] Error extracting '{metric_name}': {e}"
-            )
-            return 0.5
 
     def get_quality_label(self, score: float) -> str:
         """

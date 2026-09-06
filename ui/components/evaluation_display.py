@@ -3,7 +3,7 @@
 Evaluation Display streamlit component.
 
 After a code review is generated, this component automatically
-evaluates its quality using the RAGAS-based CodeReviewEvaluator
+evaluates its quality using the CodeReviewEvaluator
 and renders the results in a visually friendly format.
 
 What it renders:
@@ -33,7 +33,7 @@ import streamlit as st
 
 # ──────────────────────────────────────────────────────────
 # Lazy import of the evaluator — wrapped in try/except so the
-# UI still loads if RAGAS isn't installed
+# UI still loads even if the evaluator module fails to import
 # ──────────────────────────────────────────────────────────
 try:
     from core.evaluator import CodeReviewEvaluator
@@ -51,7 +51,7 @@ def render_evaluation(
     """
     Render the evaluation display in Streamlit.
 
-    This runs the RAGAS evaluation (async to the review display)
+    This runs the evaluation (async to the review display)
     and shows the results.
 
     Args:
@@ -69,7 +69,7 @@ def render_evaluation(
     if not EVALUATOR_AVAILABLE:
         st.caption(
             "📊 Review quality evaluation unavailable — "
-            "the RAGAS library is not installed."
+            "the evaluator module could not be loaded."
         )
         return None
 

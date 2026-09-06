@@ -7,5 +7,3 @@ uvicorn
 streamlit
 requests
 pydantic
-ragas>=0.1.0
-datasets>=2.0.0

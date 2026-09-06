@@ -1,16 +1,17 @@
 # tests/test_evaluator.py
 """
-Tests for the RAGAS-based Code Review Evaluator.
+Tests for the LLM-based Code Review Evaluator.
 
 These tests validate:
 - Quality label mapping (High/Good/Acceptable/Needs Review)
 - Human-readable interpretation generation
-- Graceful fallback when RAGAS is unavailable
-- Dataset preparation logic (when RAGAS is available)
+- Graceful fallback when no LLM backend is available
+- Parsing/clamping of LLM score responses
+- The full evaluated result path (with a mocked LLM client)
 
-The RAGAS-dependent tests are skipped automatically if the
-RAGAS library is not installed, so the test suite never
-fails due to a missing optional dependency.
+All tests are hermetic — they never make real network/LLM calls.
+Evaluation is tested deterministically either by forcing the fallback
+path or by injecting a fake in-memory LLM.
 
 Run with:
     pytest tests/test_evaluator.py -v
@@ -25,24 +26,41 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-# Import evaluator — this won't fail even if RAGAS is missing
-# because the module handles missing RAGAS gracefully
 from core.evaluator import CodeReviewEvaluator
+
+
+class FakeLLM:
+    """
+    Minimal stand-in for the LLM client used by the evaluator.
+
+    Provides the same `complete(...)` interface so the evaluated path
+    can be tested without any network access.
+    """
+
+    backend = "groq"
+    default_model = "fake-model"
+
+    def __init__(self, reply: str):
+        self.reply = reply
+        self.calls = []
+
+    def complete(self, messages, temperature=0.2, max_tokens=2000):
+        self.calls.append(messages)
+        return self.reply
 
 
 @pytest.fixture
 def evaluator():
     """
     Create a fresh evaluator instance for each test.
-    Note: initialization may be expensive if RAGAS is available,
-    so tests that need it use a session-scoped fixture instead.
+    Initialization is lazy (no network), so this is always cheap.
     """
     return CodeReviewEvaluator()
 
 
 # ══════════════════════════════════════════════════════════
 # Quality Label Tests
-# These test pure logic — no RAGAS or network required.
+# These test pure logic — no LLM or network required.
 # ══════════════════════════════════════════════════════════
 
 class TestQualityLabels:
@@ -164,67 +182,9 @@ class TestInterpretation:
 
 
 # ══════════════════════════════════════════════════════════
-# Dataset Preparation Tests (requires RAGAS + datasets)
-# ──────────────────────────────────────────────────────────
-
-try:
-    from core.evaluator import RAGAS_AVAILABLE as _RAGAS_INSTALLED
-except Exception:
-    _RAGAS_INSTALLED = False
-
-
-@pytest.mark.skipif(not _RAGAS_INSTALLED, reason="RAGAS not installed")
-class TestDatasetPreparation:
-    """
-    Tests for prepare_ragas_dataset.
-    Requires ragas and datasets libraries to be installed.
-    """
-
-    def test_creates_valid_dataset(self, evaluator):
-        """Should create a Dataset with the correct columns."""
-        dataset = evaluator.prepare_ragas_dataset(
-            code_input="def foo():\n    return 1",
-            generated_review={
-                "bugs": ["no bugs"],
-                "suggestions": ["add type hints"],
-                "quality_score": 8,
-                "complexity": {"time": "O(1)", "space": "O(1)",
-                               "explanation": "simple"},
-            },
-            retrieved_rules=["Use type hints for all functions"],
-            review_question="Review this Python code",
-        )
-
-        # Verify correct columns exist in RAGAS format
-        required_columns = ["question", "answer", "contexts", "ground_truth"]
-        for col in required_columns:
-            assert col in dataset.column_names, f"Missing column: {col}"
-
-    def test_empty_code_raises(self, evaluator):
-        """Empty code input should raise ValueError."""
-        with pytest.raises(ValueError):
-            evaluator.prepare_ragas_dataset(
-                code_input="",
-                generated_review={"bugs": []},
-                retrieved_rules=["rule"],
-                review_question="Review",
-            )
-
-    def test_empty_review_raises(self, evaluator):
-        """Empty review should raise ValueError."""
-        with pytest.raises(ValueError):
-            evaluator.prepare_ragas_dataset(
-                code_input="def foo(): pass",
-                generated_review=None,
-                retrieved_rules=["rule"],
-                review_question="Review",
-            )
-
-
-# ══════════════════════════════════════════════════════════
 # Graceful Fallback Tests
-# These never require RAGAS — they verify behavior when
-# evaluation cannot run.
+# These verify that evaluation degrades gracefully when no
+# LLM backend is available — without ever making a network call.
 # ──────────────────────────────────────────────────────────
 
 class TestGracefulFallback:
@@ -232,10 +192,12 @@ class TestGracefulFallback:
 
     def test_fallback_returns_expected_structure(self, evaluator):
         """
-        When RAGAS is not available, evaluation must return
-        the is_evaluated=False fallback structure, not crash.
+        Without an LLM backend, evaluation must return the
+        is_evaluated=False fallback structure, not crash.
         """
-        # This test must pass regardless of RAGAS availability
+        # Force the no-backend path deterministically
+        evaluator._llm = None
+
         result = evaluator.evaluate_review(
             code_input="def foo():\n    return 1",
             generated_review={
@@ -248,26 +210,162 @@ class TestGracefulFallback:
             retrieved_rules=["Use type hints"],
         )
 
-        # The result must always be a dict
         assert isinstance(result, dict)
-
-        # If RAGAS is not installed, it must be the fallback
-        if not _RAGAS_INSTALLED:
-            assert result["is_evaluated"] is False
-            assert result["quality_label"] == "Not evaluated"
-            assert result["overall_quality"] is None
-            assert "is_evaluated" in result
+        assert result["is_evaluated"] is False
+        assert result["quality_label"] == "Not evaluated"
+        assert result["overall_quality"] is None
+        assert result["faithfulness"] is None
+        assert "is_evaluated" in result
 
     def test_fallback_does_not_crash_with_empty_rules(self, evaluator):
         """
         Empty retrieved rules should not cause a crash.
         """
+        evaluator._llm = None
+
         result = evaluator.evaluate_review(
             code_input="x = 5",
             generated_review={"bugs": [], "suggestions": []},
             retrieved_rules=[],
         )
         assert isinstance(result, dict)
+        assert result["is_evaluated"] is False
+
+    def test_fallback_caches_no_llm_error_message(self, evaluator):
+        """Fallback error should mention configuring the LLM backend."""
+        evaluator._llm = None
+        result = evaluator.evaluate_review(
+            code_input="x = 5",
+            generated_review={"bugs": []},
+            retrieved_rules=["r"],
+        )
+        assert "LLM" in result["error"]
+
+
+# ══════════════════════════════════════════════════════════
+# LLM Score Parsing Tests
+# These exercise the parsing/clamping logic in isolation.
+# ──────────────────────────────────────────────────────────
+
+class TestScoreParsing:
+    """Test _parse_scores against raw LLM responses."""
+
+    def test_parses_valid_json(self, evaluator):
+        raw = ('{"faithfulness": 0.9, "answer_relevancy": 0.8, '
+              '"context_precision": 0.7, "context_recall": 0.6}')
+        scores = evaluator._parse_scores(raw)
+        assert scores == {
+            "faithfulness": 0.9,
+            "answer_relevancy": 0.8,
+            "context_precision": 0.7,
+            "context_recall": 0.6,
+        }
+
+    def test_parses_json_with_markdown_fence(self, evaluator):
+        raw = ('```json\n{"faithfulness": 0.5, "answer_relevancy": 0.5, '
+               '"context_precision": 0.5, "context_recall": 0.5}\n```')
+        scores = evaluator._parse_scores(raw)
+        assert all(scores[m] == 0.5 for m in scores)
+
+    def test_clamps_out_of_range_scores(self, evaluator):
+        raw = ('{"faithfulness": 5.0, "answer_relevancy": -1.0, '
+               '"context_precision": 1.2, "context_recall": 0.4}')
+        scores = evaluator._parse_scores(raw)
+        assert scores["faithfulness"] == 1.0
+        assert scores["answer_relevancy"] == 0.0
+        assert scores["context_precision"] == 1.0
+        assert scores["context_recall"] == 0.4
+
+    def test_bad_json_returns_none(self, evaluator):
+        assert evaluator._parse_scores("not json at all") is None
+
+    def test_missing_metric_returns_none(self, evaluator):
+        raw = '{"faithfulness": 0.9}'
+        assert evaluator._parse_scores(raw) is None
+
+
+# ══════════════════════════════════════════════════════════
+# Full Evaluated-Path Tests (mocked LLM, no network)
+# ──────────────────────────────────────────────────────────
+
+class TestEvaluatedPath:
+    """Test the full evaluation flow with a fake in-memory LLM."""
+
+    def test_success_returns_evaluated_result(self, evaluator):
+        llm = FakeLLM(
+            '{"faithfulness": 0.9, "answer_relevancy": 0.8, '
+            '"context_precision": 0.7, "context_recall": 0.6}'
+        )
+        evaluator._llm = llm
+
+        result = evaluator.evaluate_review(
+            code_input="def foo():\n    return 1",
+            generated_review={
+                "bugs": ["unused variable"],
+                "suggestions": ["remove it"],
+                "quality_score": 6,
+                "complexity": {"time": "O(1)", "space": "O(1)",
+                               "explanation": "simple"},
+            },
+            retrieved_rules=["Use clear variable names"],
+        )
+
+        assert result["is_evaluated"] is True
+        assert result["faithfulness"] == 0.9
+        assert result["answer_relevancy"] == 0.8
+        assert result["context_precision"] == 0.7
+        assert result["context_recall"] == 0.6
+        # 0.9*0.35 + 0.8*0.30 + 0.7*0.20 + 0.6*0.15 = 0.785
+        assert result["overall_quality"] == pytest.approx(0.785)
+        assert result["quality_label"] == "Good Quality"
+        assert isinstance(result["interpretation"], str)
+
+    def test_success_passes_review_text_and_rules(self, evaluator):
+        llm = FakeLLM(
+            '{"faithfulness": 0.5, "answer_relevancy": 0.5, '
+            '"context_precision": 0.5, "context_recall": 0.5}'
+        )
+        evaluator._llm = llm
+
+        evaluator.evaluate_review(
+            code_input="z = 1",
+            generated_review={"bugs": ["a bug"], "suggestions": ["a fix"]},
+            retrieved_rules=["Rule one", "Rule two"],
+        )
+
+        # The single user prompt should contain the code, rules, and review
+        user_content = llm.calls[0][1]["content"]
+        assert "z = 1" in user_content
+        assert "Rule one" in user_content
+        assert "a bug" in user_content
+
+    def test_unparseable_llm_response_falls_back(self, evaluator):
+        evaluator._llm = FakeLLM("I'm sorry, I can't do that.")
+
+        result = evaluator.evaluate_review(
+            code_input="x = 1",
+            generated_review={"bugs": []},
+            retrieved_rules=["some rule"],
+        )
+
+        assert result["is_evaluated"] is False
+        assert result["quality_label"] == "Not evaluated"
+
+    def test_llm_exception_falls_back(self, evaluator):
+        class ExplodingLLM:
+            def complete(self, messages, temperature=0.2, max_tokens=2000):
+                raise RuntimeError("backend down")
+
+        evaluator._llm = ExplodingLLM()
+
+        result = evaluator.evaluate_review(
+            code_input="x = 1",
+            generated_review={"bugs": []},
+            retrieved_rules=["some rule"],
+        )
+
+        assert result["is_evaluated"] is False
+        assert "unavailable" in result["error"]
 
 
 # ══════════════════════════════════════════════════════════
@@ -277,10 +375,6 @@ class TestGracefulFallback:
 class TestWeightedScore:
     """
     Tests the weighted-average composition logic.
-
-    Even though the overall score is computed inside evaluate_review
-    (which requires RAGAS), we can verify the weight definitions
-    and the formula logic used in the module.
     """
 
     def test_weights_sum_to_one(self):

@@ -22,10 +22,10 @@ do **not** modify or break any existing code — the original review flow
 works exactly as before. New features are imported only if you choose to
 use them, and they degrade gracefully if a dependency is missing.
 
-### 1. 📊 RAGAS Evaluation Pipeline (`core/evaluator.py`)
+### 1. 📊 Review Quality Evaluation (`core/evaluator.py`)
 
 After the review is generated, this optional module measures the **quality**
-of the review (not just whether it ran) using 4 RAGAS metrics:
+of the review (not just whether it ran) using 4 LLM-judged metrics:
 
 | Metric | Weight | What it measures |
 |--------|--------|------------------|
@@ -36,10 +36,11 @@ of the review (not just whether it ran) using 4 RAGAS metrics:
 
 - Produces an **overall quality score** (0–1), a **quality label**, and a
   **plain-English interpretation** that flags the weakest metric.
-- Uses the same **Groq API** (LLaMA 3.3-70B) already configured — no new keys.
+- Uses the **same LLM backend already configured** (Groq cloud by default,
+  or your local/OpenAI-compatible backend) — no new keys or packages.
 - **Async to the pipeline**: the review shows first, evaluation runs after.
-- **Graceful fallback**: if RAGAS fails, returns `is_evaluated: False` and
-  the review still works normally.
+- **Graceful fallback**: if evaluation fails or no LLM is configured,
+  returns `is_evaluated: False` and the review still works normally.
 - **Caching**: identical code+review pairs are not re-evaluated.
 
 **Usage:**
@@ -111,12 +112,9 @@ python -m pytest tests/test_github_integration.py tests/test_evaluator.py -v
 python -m pytest tests/test_github_integration.py -v
 ```
 
-**Note:** The RAGAS evaluation tests are split into:
-- Tests that never require RAGAS (labels, interpretation, fallback, weights)
-  — always run.
-- Tests that require the `ragas` + `datasets` libraries — these are
-  **automatically skipped** if RAGAS isn't installed, so the suite never
-  fails due to a missing optional dependency.
+**Note:** The evaluation tests are fully hermetic — they never call a real
+LLM. Fallback behavior is tested directly, and the successful path is
+tested with a mocked in-memory LLM, so the whole suite always runs.
 
 ## 🌐 LLM Configuration
 
@@ -190,8 +188,6 @@ is active.
 
 Added to `requirements.txt` (existing dependencies untouched):
 ```
-ragas>=0.1.0
-datasets>=2.0.0
 openai   # required for Ollama / OpenAI-compatible local backends
 ```
 
@@ -208,7 +204,7 @@ OPENAI_BASE_URL=http://localhost:1234/v1
 ### File Tree (New Files Only)
 
 ```
-core/evaluator.py                 # RAGAS evaluation pipeline
+core/evaluator.py                 # LLM-based review quality evaluation
 core/github_integration.py        # GitHub REST API integration
 core/llm_client.py                # Unified LLM client (Groq/Ollama/OpenAI/custom)
 ui/components/__init__.py

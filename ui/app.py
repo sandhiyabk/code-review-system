@@ -9,10 +9,10 @@ Space) without needing a second service.
 
 It also optionally integrates the two new additive components:
   - GitHub file input (ui.components.github_input)
-  - RAGAS review-quality evaluation (ui.components.evaluation_display)
+  - Review-quality evaluation (ui.components.evaluation_display)
 
 All optional integrations degrade gracefully if their dependencies
-(RAGAS, etc.) are unavailable. The core review always works.
+are unavailable. The core review always works.
 """
 
 import sys
@@ -238,7 +238,7 @@ with col2:
             # Copy button hint
             st.caption("👆 Click top-right corner of code block to copy")
 
-        # ── Optional RAGAS evaluation (additive, runs async) ──
+        # ── Optional review-quality evaluation (additive, runs async) ──
         if HAS_EVAL_UI:
             render_evaluation(
                 code_input=code,
